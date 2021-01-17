@@ -5,10 +5,10 @@ using System.Linq;
 using System.Runtime.Serialization;
 using System.Text.RegularExpressions;
 using System.Transactions;
-using CKAN.Extensions;
-using CKAN.Versioning;
 using log4net;
 using Newtonsoft.Json;
+using CKAN.Extensions;
+using CKAN.Versioning;
 
 namespace CKAN
 {
@@ -70,8 +70,6 @@ namespace CKAN
         private Dictionary<string, HashSet<AvailableModule>> providers
             = new Dictionary<string, HashSet<AvailableModule>>();
 
-        [JsonIgnore] private string transaction_backup;
-
         /// <summary>
         /// Returns all the activated registries, sorted by priority and name
         /// </summary>
@@ -127,7 +125,7 @@ namespace CKAN
         /// <returns>
         /// Installed modules that are incompatible, if any
         /// </returns>
-        public IEnumerable<InstalledModule> IncompatibleInstalled(KspVersionCriteria crit)
+        public IEnumerable<InstalledModule> IncompatibleInstalled(GameVersionCriteria crit)
         {
             return installed_modules.Values
                 .Where(im => !im.Module.IsCompatibleKSP(crit));
@@ -138,8 +136,8 @@ namespace CKAN
         [OnDeserialized]
         private void DeSerialisationFixes(StreamingContext context)
         {
-            // Our context is our KSP install.
-            KSP ksp = (KSP)context.Context;
+            // Our context is our game instance.
+            GameInstance ksp = (GameInstance)context.Context;
 
             // Older registries didn't have the installed_files list, so we create one
             // if absent.
@@ -160,7 +158,7 @@ namespace CKAN
 
                 foreach (KeyValuePair<string,string> tuple in installed_files)
                 {
-                    string path = KSPPathUtils.NormalizePath(tuple.Key);
+                    string path = CKANPathUtils.NormalizePath(tuple.Key);
 
                     if (Path.IsPathRooted(path))
                     {
@@ -239,8 +237,8 @@ namespace CKAN
             var oldDefaultRepo = new Uri("https://github.com/KSP-CKAN/CKAN-meta/archive/master.zip");
             if (repositories != null && repositories.TryGetValue(Repository.default_ckan_repo_name, out default_repo) && default_repo.uri == oldDefaultRepo)
             {
-                log.InfoFormat("Updating default metadata URL from {0} to {1}", oldDefaultRepo, Repository.default_ckan_repo_uri);
-                repositories["default"].uri = Repository.default_ckan_repo_uri;
+                log.InfoFormat("Updating default metadata URL from {0} to {1}", oldDefaultRepo, ksp.game.DefaultRepositoryURL);
+                repositories["default"].uri = ksp.game.DefaultRepositoryURL;
             }
 
             registry_version = LATEST_REGISTRY_VERSION;
@@ -317,8 +315,14 @@ namespace CKAN
 
         #region Transaction Handling
 
-        // We use this to record which transaction we're in.
+        // Which transaction we're in
         private string enlisted_tx;
+
+        // JSON serialization of self when enlisted with tx
+        private string transaction_backup;
+
+        // Coordinate access of multiple threads to the tx info
+        private readonly object txMutex = new object();
 
         // This *doesn't* get called when we get enlisted in a Tx, it gets
         // called when we're about to commit a transaction. We can *probably*
@@ -344,16 +348,13 @@ namespace CKAN
             // Hooray! All Tx participants have signalled they're ready.
             // So we're done, and can clear our resources.
 
-            enlisted_tx = null;
-            transaction_backup = null;
+            log.DebugFormat("Committing registry tx {0}", enlisted_tx);
+            lock (txMutex) {
+                enlisted_tx = null;
+                transaction_backup = null;
 
-            enlistment.Done();
-            log.Debug("Registry transaction committed");
-
-            // TODO: Should we save to disk at the end of a Tx?
-            // TODO: If so, we should abort if we find a save that's while a Tx is in progress?
-            //
-            // In either case, do we want the registry_manager to be Tx aware?
+                enlistment.Done();
+            }
         }
 
         public void Rollback(Enlistment enlistment)
@@ -363,14 +364,16 @@ namespace CKAN
             // In theory, this should put everything back the way it was, overwriting whatever
             // we had previously.
 
-            var options = new JsonSerializerSettings {ObjectCreationHandling = ObjectCreationHandling.Replace};
+            lock (txMutex) {
+                var options = new JsonSerializerSettings {ObjectCreationHandling = ObjectCreationHandling.Replace};
 
-            JsonConvert.PopulateObject(transaction_backup, this, options);
+                JsonConvert.PopulateObject(transaction_backup, this, options);
 
-            enlisted_tx = null;
-            transaction_backup = null;
+                enlisted_tx = null;
+                transaction_backup = null;
 
-            enlistment.Done();
+                enlistment.Done();
+            }
         }
 
         private void SaveState()
@@ -382,33 +385,37 @@ namespace CKAN
         }
 
         /// <summary>
-        /// "Pardon me, but I couldn't help but overhear you're in a Transaction..."
-        ///
         /// Adds our registry to the current transaction. This should be called whenever we
         /// do anything which may dirty the registry.
         /// </summary>
-        //
-        // http://wondermark.com/1k62/
-        private void SealionTransaction()
+        private void EnlistWithTransaction()
         {
+            // This property is thread static, so other threads can't mess with our value
             if (Transaction.Current != null)
             {
                 string current_tx = Transaction.Current.TransactionInformation.LocalIdentifier;
 
-                if (enlisted_tx == null)
+                // Multiple threads might be accessing this shared state, make sure they play nice
+                lock (txMutex)
                 {
-                    log.Debug("Pardon me, but I couldn't help overhear you're in a transaction...");
-                    Transaction.Current.EnlistVolatile(this, EnlistmentOptions.None);
-                    SaveState();
-                    enlisted_tx = current_tx;
-                }
-                else if (enlisted_tx != current_tx)
-                {
-                    throw new TransactionalKraken("CKAN registry does not support nested transactions.");
-                }
+                    if (enlisted_tx == null)
+                    {
+                        log.DebugFormat("Enlisting registry with tx {0}", current_tx);
+                        // Let's save our state before we enlist and potentially allow ourselves
+                        // to be reverted by outside code
+                        SaveState();
+                        Transaction.Current.EnlistVolatile(this, EnlistmentOptions.None);
+                        enlisted_tx = current_tx;
+                    }
+                    else if (enlisted_tx != current_tx)
+                    {
+                        throw new TransactionalKraken(
+                            $"Registry already enlisted with tx {enlisted_tx}, can't enlist with tx {current_tx}");
+                    }
 
-                // If we're here, it's a transaction we're already participating in,
-                // so do nothing.
+                    // If we're here, it's a transaction we're already participating in,
+                    // so do nothing.
+                }
             }
         }
 
@@ -416,7 +423,7 @@ namespace CKAN
 
         public void SetAllAvailable(IEnumerable<CkanModule> newAvail)
         {
-            SealionTransaction();
+            EnlistWithTransaction();
             // Clear current modules
             available_modules = new Dictionary<string, AvailableModule>();
             providers.Clear();
@@ -443,7 +450,7 @@ namespace CKAN
         /// </summary>
         public void AddAvailable(CkanModule module)
         {
-            SealionTransaction();
+            EnlistWithTransaction();
 
             var identifier = module.identifier;
             // If we've never seen this module before, create an entry for it.
@@ -471,7 +478,7 @@ namespace CKAN
             AvailableModule availableModule;
             if (available_modules.TryGetValue(identifier, out availableModule))
             {
-                SealionTransaction();
+                EnlistWithTransaction();
                 availableModule.Remove(version);
             }
         }
@@ -487,7 +494,7 @@ namespace CKAN
         /// <summary>
         /// <see cref="IRegistryQuerier.CompatibleModules"/>
         /// </summary>
-        public IEnumerable<CkanModule> CompatibleModules(KspVersionCriteria ksp_version)
+        public IEnumerable<CkanModule> CompatibleModules(GameVersionCriteria ksp_version)
         {
             // Set up our compatibility partition
             SetCompatibleVersion(ksp_version);
@@ -497,7 +504,7 @@ namespace CKAN
         /// <summary>
         /// <see cref="IRegistryQuerier.IncompatibleModules"/>
         /// </summary>
-        public IEnumerable<CkanModule> IncompatibleModules(KspVersionCriteria ksp_version)
+        public IEnumerable<CkanModule> IncompatibleModules(GameVersionCriteria ksp_version)
         {
             // Set up our compatibility partition
             SetCompatibleVersion(ksp_version);
@@ -509,7 +516,7 @@ namespace CKAN
         /// </summary>
         public CkanModule LatestAvailable(
             string module,
-            KspVersionCriteria ksp_version,
+            GameVersionCriteria ksp_version,
             RelationshipDescriptor relationship_descriptor = null)
         {
             // TODO: Consider making this internal, because practically everything should
@@ -571,7 +578,7 @@ namespace CKAN
         /// Return the latest game version compatible with the given mod.
         /// </summary>
         /// <param name="identifier">Name of mod to check</param>
-        public KspVersion LatestCompatibleKSP(string identifier)
+        public GameVersion LatestCompatibleKSP(string identifier)
         {
             return available_modules.ContainsKey(identifier)
                 ? available_modules[identifier].LatestCompatibleKSP()
@@ -589,7 +596,7 @@ namespace CKAN
         /// <param name="maxKsp">Return parameter for the highest game version</param>
         public static void GetMinMaxVersions(IEnumerable<CkanModule> modVersions,
                 out ModuleVersion minMod, out ModuleVersion maxMod,
-                out KspVersion    minKsp, out KspVersion    maxKsp)
+                out GameVersion    minKsp, out GameVersion    maxKsp)
         {
             minMod = maxMod = null;
             minKsp = maxKsp = null;
@@ -603,8 +610,8 @@ namespace CKAN
                 {
                     maxMod = rel.version;
                 }
-                KspVersion relMin = rel.EarliestCompatibleKSP();
-                KspVersion relMax = rel.LatestCompatibleKSP();
+                GameVersion relMin = rel.EarliestCompatibleKSP();
+                GameVersion relMax = rel.LatestCompatibleKSP();
                 if (minKsp == null || !minKsp.IsAny && (minKsp > relMin || relMin.IsAny))
                 {
                     minKsp = relMin;
@@ -660,7 +667,7 @@ namespace CKAN
         /// </summary>
         public List<CkanModule> LatestAvailableWithProvides(
             string                  identifier,
-            KspVersionCriteria      ksp_version,
+            GameVersionCriteria      ksp_version,
             RelationshipDescriptor  relationship_descriptor = null,
             IEnumerable<CkanModule> toInstall               = null)
         {
@@ -706,9 +713,9 @@ namespace CKAN
         /// Register the supplied module as having been installed, thereby keeping
         /// track of its metadata and files.
         /// </summary>
-        public void RegisterModule(CkanModule mod, IEnumerable<string> absolute_files, KSP ksp, bool autoInstalled)
+        public void RegisterModule(CkanModule mod, IEnumerable<string> absolute_files, GameInstance ksp, bool autoInstalled)
         {
-            SealionTransaction();
+            EnlistWithTransaction();
 
             sorter = null;
 
@@ -768,9 +775,9 @@ namespace CKAN
         ///
         /// Throws an InconsistentKraken if not all files have been removed.
         /// </summary>
-        public void DeregisterModule(KSP ksp, string module)
+        public void DeregisterModule(GameInstance ksp, string module)
         {
-            SealionTransaction();
+            EnlistWithTransaction();
 
             sorter = null;
 
@@ -810,9 +817,9 @@ namespace CKAN
         ///
         /// Does nothing if the DLL is already part of an installed module.
         /// </summary>
-        public void RegisterDll(KSP ksp, string absolute_path)
+        public void RegisterDll(GameInstance ksp, string absolute_path)
         {
-            SealionTransaction();
+            EnlistWithTransaction();
 
             string relative_path = ksp.ToRelativeGameDir(absolute_path);
 
@@ -858,7 +865,7 @@ namespace CKAN
         /// </summary>
         public void ClearDlls()
         {
-            SealionTransaction();
+            EnlistWithTransaction();
             installed_dlls = new Dictionary<string, string>();
         }
 
@@ -942,13 +949,9 @@ namespace CKAN
         /// </summary>
         public InstalledModule InstalledModule(string module)
         {
-            // In theory, someone could then modify the data they get back from
-            // this, so we sea-lion just in case.
-
-            SealionTransaction();
-
-            InstalledModule installedModule;
-            return installed_modules.TryGetValue(module, out installedModule) ? installedModule : null;
+            return installed_modules.TryGetValue(module, out InstalledModule installedModule)
+                ? installedModule
+                : null;
         }
 
         /// <summary>
@@ -1030,7 +1033,7 @@ namespace CKAN
         /// </summary>
         public string FileOwner(string file)
         {
-            file = KSPPathUtils.NormalizePath(file);
+            file = CKANPathUtils.NormalizePath(file);
 
             if (Path.IsPathRooted(file))
             {
@@ -1259,7 +1262,7 @@ namespace CKAN
         /// compatible and incompatible groups.
         /// </summary>
         /// <param name="versCrit">Version criteria to determine compatibility</param>
-        public void SetCompatibleVersion(KspVersionCriteria versCrit)
+        public void SetCompatibleVersion(GameVersionCriteria versCrit)
         {
             if (!versCrit.Equals(sorter?.CompatibleVersions))
             {

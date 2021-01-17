@@ -19,7 +19,7 @@ namespace CKAN
         {
             if (master_uri == null)
             {
-                master_uri = Repository.default_repo_master_list;
+                master_uri = Main.Instance.CurrentInstance.game.RepositoryListURL;
             }
 
             string json = Net.DownloadText(master_uri);
@@ -65,12 +65,12 @@ namespace CKAN
             try
             {
                 AddStatusMessage(Properties.Resources.MainRepoScanning);
-                bool scanChanged = CurrentInstance.ScanGameData();
+                bool scanChanged = CurrentInstance.Scan();
 
                 AddStatusMessage(Properties.Resources.MainRepoUpdating);
 
                 // Note the current mods' compatibility for the NewlyCompatible filter
-                KspVersionCriteria versionCriteria = CurrentInstance.VersionCriteria();
+                GameVersionCriteria versionCriteria = CurrentInstance.VersionCriteria();
                 IRegistryQuerier registry = RegistryManager.Instance(CurrentInstance).registry;
                 Dictionary<string, bool> oldModules = registry.CompatibleModules(versionCriteria)
                     .ToDictionary(m => m.identifier, m => false);
@@ -123,6 +123,7 @@ namespace CKAN
 
                 case RepoUpdateResult.Failed:
                     AddStatusMessage(Properties.Resources.MainRepoFailed);
+                    HideWaitDialog(false);
                     break;
 
                 case RepoUpdateResult.Updated:
@@ -135,6 +136,7 @@ namespace CKAN
                     break;
             }
 
+            tabController.HideTab("WaitTabPage");
             Util.Invoke(this, SwitchEnabledState);
             Util.Invoke(this, RecreateDialogs);
             Util.Invoke(this, ManageMods.ModGrid.Select);

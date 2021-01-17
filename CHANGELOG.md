@@ -4,10 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## v1.29.3
 
+### Features
+
+- [Multiple] Store remote version file URL in metadata resources (#3259 by: HebaruSan; reviewed: DasSkelett)
+- [Multiple] Abstract out game-specific logic (#3223 by: HebaruSan; reviewed: DasSkelett)
+
+### Bugfixes
+
+- [GUI] Fix screen clamping logic (#3255 by: HebaruSan; reviewed: DasSkelett)
+- [GUI] Repo update usability fixes (#3249 by: HebaruSan; reviewed: DasSkelett)
+
 ### Internal
 
 - [GUI] Make Mono 6 builds work on Windows (#3218, #3219 by: HebaruSan; reviewed: DasSkelett)
 - [Cmdline] Format installation errors for GitHub Actions in headless mode (#3239 by: HebaruSan; reviewed: DasSkelett)
+- [Netkan] Fix Netkan timezones again (#3246 by: HebaruSan; reviewed: DasSkelett)
+- [Netkan] Better version overrides in Netkan (#3265 by: HebaruSan; reviewed: DasSkelett)
+- [Tooling] Pull request merge script (#3263 by: HebaruSan; reviewed: DasSkelett)
 
 ## v1.29.2 (Freedman)
 

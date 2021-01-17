@@ -8,8 +8,10 @@ using ICSharpCode.SharpZipLib.Zip;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
+using CKAN.Versioning;
 using CKAN.Extensions;
 using CKAN.NetKAN.Sources.Avc;
+using CKAN.Games;
 
 namespace CKAN.NetKAN.Services
 {
@@ -53,7 +55,8 @@ namespace CKAN.NetKAN.Services
         {
             try
             {
-                ModuleInstaller.FindInstallableFiles(module, filePath, null);
+                ModuleInstaller.FindInstallableFiles(module, filePath,
+                    new GameInstance(new KerbalSpaceProgram(), "/", "dummy", new NullUser()));
             }
             catch (BadMetadataKraken)
             {
@@ -64,32 +67,32 @@ namespace CKAN.NetKAN.Services
             return true;
         }
 
-        public IEnumerable<InstallableFile> GetConfigFiles(CkanModule module, ZipFile zip)
+        public IEnumerable<InstallableFile> GetConfigFiles(CkanModule module, ZipFile zip, GameInstance inst)
         {
-            return GetFilesBySuffix(module, zip, ".cfg");
+            return GetFilesBySuffix(module, zip, ".cfg", inst);
         }
 
-        public IEnumerable<InstallableFile> GetPlugins(CkanModule module, ZipFile zip)
+        public IEnumerable<InstallableFile> GetPlugins(CkanModule module, ZipFile zip, GameInstance inst)
         {
-            return GetFilesBySuffix(module, zip, ".dll");
+            return GetFilesBySuffix(module, zip, ".dll", inst);
         }
 
-        public IEnumerable<InstallableFile> GetCrafts(CkanModule module, ZipFile zip, KSP ksp)
+        public IEnumerable<InstallableFile> GetCrafts(CkanModule module, ZipFile zip, GameInstance ksp)
         {
             return GetFilesBySuffix(module, zip, ".craft", ksp);
         }
 
-        private IEnumerable<InstallableFile> GetFilesBySuffix(CkanModule module, ZipFile zip, string suffix, KSP ksp = null)
+        private IEnumerable<InstallableFile> GetFilesBySuffix(CkanModule module, ZipFile zip, string suffix, GameInstance ksp)
         {
             return ModuleInstaller
                 .FindInstallableFiles(module, zip, ksp)
-                .Where(instF => instF.source.Name.EndsWith(suffix,
+                .Where(instF => instF.destination.EndsWith(suffix,
                     StringComparison.InvariantCultureIgnoreCase));
         }
 
         public IEnumerable<string> FileDestinations(CkanModule module, string filePath)
         {
-            var ksp = new KSP("/", "dummy", null, false);
+            var ksp = new GameInstance(new KerbalSpaceProgram(), "/", "dummy", null, false);
             return ModuleInstaller
                 .FindInstallableFiles(module, filePath, ksp)
                 .Where(f => !f.source.IsDirectory)
@@ -97,10 +100,102 @@ namespace CKAN.NetKAN.Services
         }
 
         /// <summary>
-        /// Return a parsed JObject from a stream.
+        /// Update the game versions of a module.
+        /// Final range will be the union of the previous and new ranges.
+        /// Note that this means we always increase, never decrease, compatibility.
         /// </summary>
+        /// <param name="json">The module being inflated</param>
+        /// <param name="ver">The single game version</param>
+        /// <param name="minVer">The minimum game version</param>
+        /// <param name="maxVer">The maximum game version</param>
+        public static void ApplyVersions(JObject json, GameVersion ver, GameVersion minVer, GameVersion maxVer)
+        {
+            // Get the minimum and maximum game versions that already exist in the metadata.
+            // Use specific game version if min/max don't exist.
+            var existingMinStr = (string)json["ksp_version_min"] ?? (string)json["ksp_version"];
+            var existingMaxStr = (string)json["ksp_version_max"] ?? (string)json["ksp_version"];
 
-        // Courtesy https://stackoverflow.com/questions/8157636/can-json-net-serialize-deserialize-to-from-a-stream/17788118#17788118
+            var existingMin = existingMinStr == null ? null : GameVersion.Parse(existingMinStr);
+            var existingMax = existingMaxStr == null ? null : GameVersion.Parse(existingMaxStr);
+
+            GameVersion avcMin, avcMax;
+            if (minVer == null && maxVer == null)
+            {
+                // Use specific game version if min/max don't exist
+                avcMin = avcMax = ver;
+            }
+            else
+            {
+                avcMin = minVer;
+                avcMax = maxVer;
+            }
+
+            // Now calculate the minimum and maximum KSP versions between both the existing metadata and the
+            // AVC file.
+            var gameVerMins  = new List<GameVersion>();
+            var gameVerMaxes = new List<GameVersion>();
+
+            if (!GameVersion.IsNullOrAny(existingMin))
+                gameVerMins.Add(existingMin);
+
+            if (!GameVersion.IsNullOrAny(avcMin))
+                gameVerMins.Add(avcMin);
+
+            if (!GameVersion.IsNullOrAny(existingMax))
+                gameVerMaxes.Add(existingMax);
+
+            if (!GameVersion.IsNullOrAny(avcMax))
+                gameVerMaxes.Add(avcMax);
+
+            var gameVerMin = gameVerMins.DefaultIfEmpty(null).Min();
+            var gameVerMax = gameVerMaxes.DefaultIfEmpty(null).Max();
+
+            if (gameVerMin != null || gameVerMax != null)
+            {
+                // If we have either a minimum or maximum game version, remove all existing game version
+                // information from the metadata.
+                json.Remove("ksp_version");
+                json.Remove("ksp_version_min");
+                json.Remove("ksp_version_max");
+
+                if (gameVerMin != null && gameVerMax != null)
+                {
+                    // If we have both a minimum and maximum game version...
+                    if (gameVerMin.Equals(gameVerMax))
+                    {
+                        // ...and they are equal, then just set ksp_version
+                        Log.DebugFormat("Min and max game versions are same, setting ksp_version");
+                        json["ksp_version"] = gameVerMin.ToString();
+                    }
+                    else
+                    {
+                        // ...otherwise set both ksp_version_min and ksp_version_max
+                        Log.DebugFormat("Min and max game versions are different, setting both");
+                        json["ksp_version_min"] = gameVerMin.ToString();
+                        json["ksp_version_max"] = gameVerMax.ToString();
+                    }
+                }
+                else
+                {
+                    // If we have only one or the other then set which ever is applicable
+                    if (gameVerMin != null)
+                    {
+                        Log.DebugFormat("Only min game version is set");
+                        json["ksp_version_min"] = gameVerMin.ToString();
+                    }
+                    if (gameVerMax != null)
+                    {
+                        Log.DebugFormat("Only max game version is set");
+                        json["ksp_version_max"] = gameVerMax.ToString();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Return a parsed JObject from a stream.
+        /// Courtesy https://stackoverflow.com/questions/8157636/can-json-net-serialize-deserialize-to-from-a-stream/17788118#17788118
+        /// </summary>
         private static JObject DeserializeFromStream(Stream stream)
         {
             using (var sr = new StreamReader(stream))
@@ -127,7 +222,8 @@ namespace CKAN.NetKAN.Services
             const string versionExt = ".version";
 
             // Get all our version files.
-            var files = ModuleInstaller.FindInstallableFiles(module, zipfile, null)
+            var ksp = new GameInstance(new KerbalSpaceProgram(), "/", "dummy", new NullUser());
+            var files = ModuleInstaller.FindInstallableFiles(module, zipfile, ksp)
                 .Select(x => x.source)
                 .Where(source => source.Name.EndsWith(versionExt,
                     StringComparison.InvariantCultureIgnoreCase))
